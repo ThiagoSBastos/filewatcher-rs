@@ -1,12 +1,13 @@
 use std::fs;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 #[derive(Debug)]
 pub struct FileWatcher {
     dirname: PathBuf,
-    filemap: HashMap<String, FileEvent>,
+    filemap: HashMap<String, (FileEvent, SystemTime)>,
 }
 
 #[derive(Debug)]
@@ -17,7 +18,7 @@ pub enum FileEvent {
 }
 
 impl FileWatcher {
-    fn get_files (pathname: &PathBuf) -> io::Result<Vec<PathBuf>>{
+    fn get_files (pathname: &PathBuf) -> io::Result<Vec<(String, SystemTime)>>{
         let mut filenames = vec![];
         let entries = fs::read_dir(&pathname)?;
         for entry in entries {
@@ -29,7 +30,7 @@ impl FileWatcher {
             }
 
             if meta.is_file() {
-                filenames.push(entry.path());
+                filenames.push((entry.path().display().to_string(), meta.modified()?));
             }
         }
 
@@ -42,25 +43,61 @@ impl FileWatcher {
         let filenames = Self::get_files(&pathname)?;
 
         let mut fmap = HashMap::new();
-        for el in filenames {
-            fmap.insert(el.into_os_string().into_string().unwrap(), FileEvent::Created);
+        for (el, time) in filenames {
+            fmap.insert(el, (FileEvent::Created, time));
         }
 
         Ok(FileWatcher{dirname: pathname, filemap: fmap})
     }
 
-    pub fn watch(&self, _action: impl FnOnce(FileEvent)) -> io::Result<()>{
+    pub fn watch(&mut self, action: impl Fn(FileEvent)) -> io::Result<()>{
 
         println!("Action performed on {}", self.dirname.as_path().display().to_string());
         for (key,value) in &self.filemap { println!("key: {}, value: {:?}", key, value); }
 
-        // loop {
-        // make a state machine before any action has been done to check the current state of the
-        // file
-        // action();
-        // }
+        loop {
+            let curr_list = Self::get_files(&self.dirname)?;
+            let (curr_file_list, _): (Vec<String>, Vec<SystemTime>) = curr_list.clone().into_iter().unzip();
 
-        Ok(())
+            // Case 0: The file no longer exists and should be DELETED
+            let old_set: HashSet<String> = self.filemap.keys().cloned().collect();
+            let curr_set: HashSet<String> = curr_file_list.iter().cloned().collect();
+            let sym_difference: Vec<String> = (&old_set - &curr_set).iter().cloned().collect();
+            for removed_file in sym_difference {
+                action(FileEvent::Deleted);
+                self.filemap.remove(&removed_file);
+            }
+
+            for (file, curr_time) in &curr_list {
+                // Case 1: The file was already mapped and may have been UPDATED
+                if self.filemap.contains_key(file) {
+                    // Check if file has been modified, if it is, mark as UPDATED
+                    let metadata = fs::metadata(&file)?;
+                    match metadata.modified() { // FIXME: Figure out why this doesn't work
+                        Ok(curr_time) => {
+                            let sys_time = SystemTime::now();
+                            let curr_duration = curr_time.duration_since(sys_time);
+                            let old_duration = self.filemap.get(file).unwrap().1.duration_since(sys_time);
+
+                            match (curr_duration, old_duration) {
+                                (Ok(curr_duration), Ok(old_duration)) => {
+                                    if (curr_duration.as_secs() - old_duration.as_secs()) > 0 {
+                                        println!("Modified")
+                                    }
+                                },
+                                _ => (),
+                            }
+                        },
+                        Err(e) => return Err(e),
+                    }
+                }
+                // Case 2: The file was CREATED
+                else {
+                    action(FileEvent::Created);
+                    self.filemap.insert(file.clone(), (FileEvent::Created, curr_time.clone()));
+                }
+            }
+        }
     }
 }
 
